@@ -416,7 +416,10 @@ void SettingsWindow(const render::upscale::Status& s) {
             config::SaveTargetFps(fps);
         }
         if (hf.active)
-            ImGui::TextColored(kGreen, "Unlocked at %d FPS, game speed kept", hf.target);
+            if (hf.limit < hf.target)
+                ImGui::TextColored(kGreen, "Unlocked, held at %d FPS (the GPU's pace, no judder), game speed kept", hf.limit);
+            else
+                ImGui::TextColored(kGreen, "Unlocked at %d FPS, game speed kept", hf.target);
         else if (hf.reason[0])
             ImGui::TextDisabled("%s", hf.reason);
         ImGui::TextDisabled("The game keeps its speed from 60 FPS up to the limit; below 60 it slows down as the original does.");

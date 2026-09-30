@@ -6,6 +6,7 @@
 #include "hooks/hook_manager.h"
 
 #include <Windows.h>
+#include <intrin.h>
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
 
@@ -34,6 +35,10 @@ constexpr const char* kClockPattern = "E8 ?? ?? ?? ?? BA 8C 00 00 00 EB";
 constexpr const char* kMoveMapPattern = "41 88 6E 1C 48 8D 05 ?? ?? ?? ?? 49 89 46 20 48 8D 05 ?? ?? ?? ?? 49 89 06";
 // The cutscene step table's static initializer: xor edx, edx; lea rcx, [table]; lea r8d, [rdx+78h]; call memset.
 constexpr const char* kRemoPattern = "33 D2 48 8D 0D ?? ?? ?? ?? 44 8D 42 78 E8";
+// The limiter's wait, WaitUntil(clock, ticks): rate = clock+60h; ...; QPC (returns at +1Eh); loop: QPC
+// (returns at +54h) until (QPC - start) * rate / frequency >= ticks.
+constexpr const char* kWaitPattern = "8B 41 60 8B F2 48 8B F9 85 C0 74 ?? 48 89 5C 24 38 48 8D 4C 24 30 8B D8 FF 15";
+constexpr size_t kWaitFirstReturn = 0x1E, kWaitLoopReturn = 0x54;
 // Main update, Havok section: ...; mov edx, 5; call ProfileBegin; movaps xmm1, xmm6; mov rcx, [world];
 // call HavokStep (the call is at +38; the step itself is in the protected section).
 constexpr const char* kHavokPattern =
@@ -62,18 +67,44 @@ constexpr ULONGLONG kPressWindowMs = 250;
 // ---------------------------------------------------------------------------------------------------
 
 std::atomic<int> g_target{kGameFps};
-// Time step / (1/60) while active: the last frame's real duration, at most 1/60 s (the game never ran
-// with longer steps: below 60 FPS it slows down as the original does).
+// The simulation's last time step / (1/60), for the mouse (see StepScale).
 std::atomic<float> g_dtScale{1.0f};
-int64_t g_qpcFrequency = 0, g_lastFrame = 0;
+std::atomic<uint64_t> g_simulationSteps{0};  // diagnostics: simulation updates vs presented frames
+int64_t g_qpcFrequency = 0;
 std::atomic<bool> g_active{false};
 bool g_available = false;
 const char* g_reason = "not installed";
 ULONGLONG g_installTick = 0;
 
 uintptr_t g_image = 0;
+
+
 uintptr_t g_clockGlobal = 0;  // address of the frame clock pointer
 int g_appliedTarget = 0;  // what the engine was last set to (0: never touched)
+// The clock's rate: the target, or lower while the GPU can't keep up (see AdaptLimit).
+std::atomic<int> g_limit{kGameFps};
+// Time the limiter spent waiting (QPC ticks, all frames): unused capacity. The executable's
+// QueryPerformanceCounter import is hooked; only the two calls in the wait loop are looked at.
+uintptr_t g_waitFirst = 0, g_waitLoop = 0;
+int64_t g_waitPrevious = 0;
+std::atomic<int64_t> g_waitTotal{0};
+bool g_waitMeasured = false;
+using Qpc_t = BOOL(WINAPI*)(LARGE_INTEGER*);
+Qpc_t oQpc = nullptr;
+
+BOOL WINAPI hkQpc(LARGE_INTEGER* counter) {
+    const BOOL ok = oQpc(counter);
+    const auto caller = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    if (ok && counter) {
+        if (caller == g_waitLoop) {
+            g_waitTotal.fetch_add(counter->QuadPart - g_waitPrevious, std::memory_order_relaxed);
+            g_waitPrevious = counter->QuadPart;
+        } else if (caller == g_waitFirst) {
+            g_waitPrevious = counter->QuadPart;
+        }
+    }
+    return ok;
+}
 
 uintptr_t g_remoTable = 0;
 bool g_remoHooked = false;
@@ -128,40 +159,70 @@ using RemoStep_t = uintptr_t(__fastcall*)(void*, float, void*, void*);
 Step_t oMoveMapUpdate = nullptr, oFxUpdate = nullptr, oHavokStep = nullptr;
 RemoStep_t oRemoUpdate = nullptr;
 
-void LogStepOnce(std::atomic<bool>& logged, const char* what, float incoming) {
-    if (logged.exchange(true)) return;
-    log::Info("High FPS: {} time step {:.6f} -> {:.6f} s", what, incoming, incoming * Scale());
+// Time step / (1/60) for one updater (a hooked function and its object): the real time since it last
+// ran, on the thread that runs it, at most 1/60 s (the game never ran with longer steps: below 60 FPS
+// it slows down as the original does). Not the presented frame rate: the simulation thread can run
+// several updates per presented frame when the GPU is the limit.
+float StepScale(const void* hook, const void* self) {
+    struct Key {
+        const void* hook;
+        const void* self;
+        bool operator==(const Key&) const = default;
+    };
+    struct Hash {
+        size_t operator()(const Key& k) const { return std::hash<const void*>()(k.hook) * 31 ^ std::hash<const void*>()(k.self); }
+    };
+    static std::mutex mutex;
+    static std::unordered_map<Key, int64_t, Hash> last;
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    std::lock_guard lock(mutex);
+    if (last.size() > 1024) last.clear();
+    int64_t& previous = last[{hook, self}];
+    const int64_t elapsed = previous ? now.QuadPart - previous : 0;
+    previous = now.QuadPart;
+    if (!elapsed) return static_cast<float>(kGameFps) / static_cast<float>(g_target.load());  // first step: the target's
+    const double scale = static_cast<double>(elapsed) * kGameFps / static_cast<double>(g_qpcFrequency);
+    return static_cast<float>(std::clamp(scale, 0.01, 1.0));
+}
+
+// Scale of the step `what` gets now (1 while the unlock is off), logged the first time.
+float Step(std::atomic<bool>& logged, const char* what, const void* hook, const void* self, float incoming) {
+    if (!g_active.load(std::memory_order_relaxed)) return 1.0f;
+    const float scale = StepScale(hook, self);
+    if (!logged.exchange(true))
+        log::Info("High FPS: {} time step {:.6f} -> {:.6f} s", what, incoming, incoming * scale);
+    return scale;
 }
 
 void PatchCode();
 
 uintptr_t __fastcall hkMoveMapUpdate(void* self, float dt) {
     static std::atomic<bool> logged{false};
+    const float scale = Step(logged, "simulation", &hkMoveMapUpdate, self, dt);
     if (g_active.load(std::memory_order_relaxed)) {
-        LogStepOnce(logged, "simulation", dt);
+        g_dtScale.store(scale, std::memory_order_relaxed);
+        g_simulationSteps.fetch_add(1, std::memory_order_relaxed);
         if (!g_codePatched.load(std::memory_order_relaxed) && GetTickCount64() - g_installTick >= kCodePatchDelayMs)
             PatchCode();
     }
-    return oMoveMapUpdate(self, dt * Scale());
+    return oMoveMapUpdate(self, dt * scale);
 }
 
 uintptr_t __fastcall hkRemoUpdate(void* self, float dt, void* a3, void* a4) {
     static std::atomic<bool> logged{false};
-    if (g_active.load(std::memory_order_relaxed)) LogStepOnce(logged, "cutscene", dt);
-    return oRemoUpdate(self, dt * Scale(), a3, a4);
+    return oRemoUpdate(self, dt * Step(logged, "cutscene", &hkRemoUpdate, self, dt), a3, a4);
 }
 
 uintptr_t __fastcall hkFxUpdate(void* self, float dt) {
     static std::atomic<bool> logged{false};
-    if (g_active.load(std::memory_order_relaxed)) LogStepOnce(logged, "effects", dt);
-    return oFxUpdate(self, dt * Scale());
+    return oFxUpdate(self, dt * Step(logged, "effects", &hkFxUpdate, self, dt));
 }
 
 // Reached from the relay the Havok call site now calls.
 uintptr_t __fastcall HavokStep(void* world, float dt) {
     static std::atomic<bool> logged{false};
-    if (g_active.load(std::memory_order_relaxed)) LogStepOnce(logged, "physics", dt);
-    return oHavokStep(world, dt * Scale());
+    return oHavokStep(world, dt * Step(logged, "physics", &HavokStep, world, dt));
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -206,8 +267,9 @@ uint64_t g_seq = 0;
 ULONGLONG g_lastPress = 0;
 std::unordered_map<void*, uint64_t> g_menuSeen;  // menu object -> press it acted on
 
-float RepeatStep(float dt) {
-    const float scale = Scale();
+float RepeatStep(void* self, float dt) {
+    if (!g_active.load(std::memory_order_relaxed)) return dt;
+    const float scale = StepScale(&RepeatStep, self);
     if (scale >= 1.0f) return dt;
     // Only the engine's fixed 1/60 is corrected (not a time step that already is the real one).
     const float nominal = 1.0f / kGameFps;
@@ -254,7 +316,7 @@ void __fastcall hkDetector(void* self, void* output, void* a3, void* input, floa
     Detector& d = g_detectors[I];
     if (d.repeat) {
         static std::atomic<bool> logged{false};
-        const float corrected = RepeatStep(dt);
+        const float corrected = RepeatStep(self, dt);
         if (corrected != dt && !logged.exchange(true))
             log::Info("High FPS: input repeat time step {:.6f} -> {:.6f} s", dt, corrected);
         dt = corrected;
@@ -522,6 +584,7 @@ void LogClock(const char* when) {
 
 void Apply(int target) {
     const bool high = target > kGameFps;
+    g_limit = target;
     LogClock("before");
     if (!SetClockRate(target)) {
         log::Warn("High FPS: the engine frame clock is not there yet");
@@ -530,7 +593,6 @@ void Apply(int target) {
     LogClock("after");
     // Until the first frame is measured: the target's frame time.
     g_dtScale = static_cast<float>(kGameFps) / static_cast<float>(target);
-    g_lastFrame = 0;
     g_active = high;
     if (g_appliedTarget != target)
         log::Info("High FPS: frame clock at {} FPS{}", target, high ? ", time steps follow the real frame time" : "");
@@ -562,6 +624,16 @@ bool FindAll() {
     if (!moveMapHit || moveMapVTables.empty() || Relative(*moveMapHit + 15, 3, 7) != moveMapVTables.front())
         return missing("MoveMapStep");
     const uintptr_t moveMapSteps = Relative(*moveMapHit + 4, 3, 7);
+
+    // The limiter's wait: optional (without it the limit only comes back up by trying).
+    if (const auto waitHit = FindPattern(kWaitPattern);
+        waitHit && *reinterpret_cast<const uint16_t*>(*waitHit + kWaitFirstReturn - 6) == 0x15FF &&
+        *reinterpret_cast<const uint16_t*>(*waitHit + kWaitLoopReturn - 6) == 0x15FF) {
+        g_waitFirst = *waitHit + kWaitFirstReturn;
+        g_waitLoop = *waitHit + kWaitLoopReturn;
+        g_waitMeasured = hooks::PatchImport(GetModuleHandleW(nullptr), "kernel32.dll", "QueryPerformanceCounter", &hkQpc, &oQpc);
+    }
+    if (!g_waitMeasured) log::Warn("High FPS: the limiter's wait isn't measured - the limit comes back up by trying");
 
     const auto remoHit = FindPattern(kRemoPattern);
     if (!remoHit) return missing("cutscene steps");
@@ -636,6 +708,54 @@ bool g_limiterFailed = false;
 int64_t g_windowStart = 0;
 int g_windowFrames = 0, g_overWindows = 0;
 
+// The engine skips rendering a frame when it falls behind its clock: with the GPU as the limit it runs
+// two simulation updates for some presented frames and one for others, and the image judders. The
+// clock's rate goes down to what is presented (no skipped frames), then back up by steps while the
+// frames keep up, towards the target. Without skipping, one update per presented frame.
+// Back up: from the limiter's wait, the capacity left unused (frames ready early: the GPU was freed by a
+// lower resolution, DLSS 5 off, another program closed...): fps / (1 - wait share), straight to 95 % of
+// it. Without the wait measured, by steps.
+void AdaptLimit(int target, double fps, double updates, double waitShare) {
+    static int calm = 0;           // seconds without skipped frames
+    static int headroom = 0;       // seconds in a row with the limiter waiting
+    static double ceiling = 1e9;   // presented FPS the last time frames were skipped
+    int limit = g_limit.load();
+    const bool skipping = updates > fps * 1.04 + 1.0;
+    if (skipping) {
+        calm = headroom = 0;
+        ceiling = fps;
+        const int lower = std::max(kGameFps, static_cast<int>(fps * 0.97));
+        if (lower >= limit) return;
+        limit = lower;
+    } else if (waitShare >= 0.0) {
+        if (limit >= target || waitShare < 0.06) {
+            headroom = 0;
+            return;
+        }
+        if (++headroom < 2) return;
+        headroom = 0;
+        ceiling = 1e9;
+        const double capacity = fps / std::max(0.05, 1.0 - waitShare);
+        limit = std::min(target, std::max(limit + 2, static_cast<int>(capacity * 0.95)));
+    } else {
+        ++calm;
+        if (limit >= target) return;
+        // Up to just below where frames were last skipped every 3 s; past it, a try every 30 s.
+        const bool belowCeiling = limit < ceiling * 0.97;
+        if (calm < (belowCeiling ? 3 : 30)) return;
+        calm = 0;
+        limit = std::min(target, limit + std::max(2, limit / 30));
+        if (!belowCeiling) ceiling = 1e9;
+    }
+    static int logged = 0;
+    if (++logged <= 30)
+        log::Info("High FPS: limit {} -> {} ({:.1f} frames presented/s, {:.1f} simulation updates/s, limiter waiting "
+                  "{:.0f} %){}", g_limit.load(), limit, fps, updates, std::max(0.0, waitShare) * 100,
+                  logged == 30 ? " (not logged any more)" : "");
+    g_limit = limit;
+    SetClockRate(limit);
+}
+
 void WatchLimiter(int target) {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
@@ -644,27 +764,27 @@ void WatchLimiter(int target) {
     const double seconds = static_cast<double>(now.QuadPart - g_windowStart) / g_qpcFrequency;
     if (seconds < 1.0) return;
     const double fps = g_windowFrames / seconds;
+    static int windows = 0;
+    static uint64_t lastSteps = 0;
+    const uint64_t steps = g_simulationSteps.load();
+    const double updates = (steps - lastSteps) / seconds;
+    static int64_t lastWait = 0;
+    const int64_t wait = g_waitTotal.load();
+    const double waitShare = g_waitMeasured ? static_cast<double>(wait - lastWait) / (seconds * g_qpcFrequency) : -1.0;
+    lastWait = wait;
+    if (++windows % 30 == 0 && g_active.load())
+        log::Info("High FPS: {:.1f} frames presented/s, {:.1f} simulation updates/s, limit {}, limiter waiting {:.0f} % "
+                  "(step x{:.3f})", fps, updates, g_limit.load(), std::max(0.0, waitShare) * 100, g_dtScale.load());
+    lastSteps = steps;
     g_windowStart = now.QuadPart;
     g_windowFrames = 0;
-    g_overWindows = fps > target * 1.5 + 10 ? g_overWindows + 1 : 0;
+    if (g_active.load() && updates > 0) AdaptLimit(target, fps, updates, waitShare);
+    g_overWindows = fps > g_limit.load() * 1.5 + 10 ? g_overWindows + 1 : 0;
     if (g_overWindows < 2) return;
     log::Error("High FPS: {:.0f} FPS with the limit at {} - the frame limiter isn't holding, back to 60 FPS", fps, target);
     LogClock("not holding");
     g_limiterFailed = true;
     g_target = kGameFps;
-}
-
-// The next frame's time step: this frame's duration (present to present, where the limiter waits),
-// between the shortest frame the limiter allows and 1/60 s.
-void MeasureFrame() {
-    LARGE_INTEGER now;
-    QueryPerformanceCounter(&now);
-    if (g_lastFrame) {
-        const double seconds = static_cast<double>(now.QuadPart - g_lastFrame) / static_cast<double>(g_qpcFrequency);
-        const double scale = std::clamp(seconds * kGameFps, static_cast<double>(kGameFps) / kMaxFps, 1.0);
-        g_dtScale.store(static_cast<float>(scale), std::memory_order_relaxed);
-    }
-    g_lastFrame = now.QuadPart;
 }
 
 }  // namespace
@@ -693,11 +813,10 @@ void OnFrame() {
     // every frame would release the limiter every frame.
     if (g_appliedTarget != target) {
         Apply(target);
-    } else if (const int rate = ClockRate(); rate >= 0 && rate != target) {
+    } else if (const int rate = ClockRate(); rate >= 0 && rate != g_limit.load()) {
         LogReapply(rate);
-        SetClockRate(target);
+        SetClockRate(g_limit.load());
     }
-    if (g_active.load(std::memory_order_relaxed)) MeasureFrame();
     if (!g_limiterFailed) WatchLimiter(target);
 }
 
@@ -712,6 +831,7 @@ Status GetStatus() {
     s.available = g_available;
     s.active = g_active.load();
     s.target = g_target.load();
+    s.limit = g_limit.load();
     if (!g_available)
         s.reason = g_reason;
     else if (g_limiterFailed)

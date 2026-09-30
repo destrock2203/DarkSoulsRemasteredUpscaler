@@ -3,13 +3,18 @@
 // Frame rate unlock with the game's speed kept. The engine is built around 60 FPS: its frame limiter
 // runs a clock at 60 ticks per second, and the update code hands a fixed 1/60 s time step to the
 // subsystems whatever the real frame time. Above 60 FPS the game would run too fast, so the unlock
-// raises the limiter and replaces that step with the last frame's real duration, at most 1/60 s: the
+// raises the limiter and replaces that step with the real time since that updater last ran (on the
+// simulation thread, which can update more often than frames are presented), at most 1/60 s: the
 // speed is right at any frame rate from 60 up to the target (below 60 the game slows down, as the
 // original does; longer steps than the game ever had would risk its physics):
 //  - pacing: the limiter clock (a global, the object game/frame_timer.h describes) gets the target
 //    rate, its start moved so the schedule keeps its phase. The flipper's high refresh mode (owner mode
 //    5, FrpgFlipper_140FPS) is left alone: the engine sets its mode back every frame, and the clock
-//    alone sets the frame rate.
+//    alone sets the frame rate. The engine skips rendering a frame when it is late (2 updates for 1
+//    image: the image judders), so while the GPU is the limit the clock runs at what is presented,
+//    and goes back up as soon as the limiter's wait (measured on its QueryPerformanceCounter calls)
+//    shows capacity left unused.
+//    (Rendering every frame with FrpgFlipper_60FPS_NoSkip's methods crashed in Havok.)
 //  - simulation: MoveMapStep's step table (.data, the step at index 13 is the in-game update, float
 //    time step in xmm1), the cutscene (Remo) step table's index 9, the FX manager (frpgFxManagerBase,
 //    vtable slot 5) and the Havok world step (a call site in the main update function, relayed).
@@ -38,6 +43,7 @@ struct Status {
     bool available = false;  // everything found and hooked
     bool active = false;     // the engine runs at `target`
     int target = kGameFps;
+    int limit = kGameFps;  // the clock's rate now: below the target while the GPU can't keep up
     const char* reason = "";  // why unavailable or not active yet
 };
 Status GetStatus();
