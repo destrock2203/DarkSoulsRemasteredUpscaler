@@ -5,7 +5,7 @@
 #include "core/paths.h"
 #include "core/perf.h"
 #include "framegen/framegen.h"
-#include "game/dshr.h"
+#include "game/high_fps.h"
 #include "hooks/hook_manager.h"
 #include "render/presenter.h"
 #include "render/upscale.h"
@@ -382,7 +382,7 @@ void SettingsWindow(const render::upscale::Status& s) {
         else if (fg.enabled)
             ImGui::TextDisabled("Waiting for gameplay (TXAA on; off in menus and loading screens).");
     }
-    ImGui::TextDisabled("Keep game FPS x multiplier at or below the refresh rate (DSHR's TargetFPS).");
+    ImGui::TextDisabled("Keep game FPS x multiplier at or below the refresh rate (Frame rate below).");
 
     ImGui::SeparatorText("DLSS 5 (neural rendering)");
     bool dlss5 = s.dlss5Enabled;
@@ -403,12 +403,24 @@ void SettingsWindow(const render::upscale::Status& s) {
     ImGui::TextDisabled("Needs the DLSS 5 runtime (nvngx_dlssnr.dll, not included) in DSRUpscaler\\ - RTX 50.");
 
     ImGui::SeparatorText("Frame rate");
-    const game::dshr::Status dshr = game::dshr::Get();
-    if (dshr.installed)
-        ImGui::Text("DSHR %s: target %d FPS (DSHRHook.ini)", dshr.loaded ? "active" : "installed, not loaded", dshr.targetFps);
-    else
-        ImGui::TextWrapped("The game is limited to 60 FPS. DSHR (dinput8.dll + DSHRHook.ini next to the game) unlocks "
-                           "it with the game's speed kept; frame generation multiplies it.");
+    const game::high_fps::Status hf = game::high_fps::GetStatus();
+    if (!hf.available) {
+        ImGui::TextColored(kYellow, "Unavailable: %s", hf.reason);
+    } else {
+        // Applied when the slider is released (each change restarts the engine's frame clock).
+        static int fps = config::Get().targetFps;
+        ImGui::SetNextItemWidth(220.0f);
+        ImGui::SliderInt("Game FPS limit", &fps, game::high_fps::kGameFps, 360, fps <= 60 ? "60 (the game's)" : "%d");
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            game::high_fps::SetTarget(fps);
+            config::SaveTargetFps(fps);
+        }
+        if (hf.active)
+            ImGui::TextColored(kGreen, "Unlocked at %d FPS, game speed kept", hf.target);
+        else if (hf.reason[0])
+            ImGui::TextDisabled("%s", hf.reason);
+        ImGui::TextDisabled("The game keeps its speed from 60 FPS up to the limit; below 60 it slows down as the original does.");
+    }
 
     ImGui::SeparatorText("Status");
     if (s.active)

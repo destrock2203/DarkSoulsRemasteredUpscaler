@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/perf.h"
 #include "framegen/framegen.h"
+#include "game/high_fps.h"
 #include "hooks/d3d11_hooks.h"
 #include "overlay/overlay.h"
 #include "render/bridge.h"
@@ -381,6 +382,7 @@ private:
     HRESULT DoPresent(UINT syncInterval, UINT flags) {
         if (flags & DXGI_PRESENT_TEST) return S_OK;
         perf::PresentEntered();
+        game::high_fps::OnFrame();
         upscale::OnPresent();
         // What is shown: the game's back buffer as it is, or an output-size image (the upscaled frame
         // drawn by render/upscale.h, or the back buffer stretched to the output).

@@ -6,7 +6,7 @@
 #include "core/log.h"
 #include "core/paths.h"
 #include "game/dsr.h"
-#include "game/dshr.h"
+#include "game/high_fps.h"
 #include "hooks/dxgi_hooks.h"
 #include "hooks/hook_manager.h"
 #include "proxy/proxy_host.h"
@@ -59,7 +59,6 @@ void Initialize() {
               cfg.upscalerEnabled ? "on" : "off", ToString(cfg.backend), cfg.frameGeneration ? "on" : "off",
               ToString(cfg.frameGenerationBackend), cfg.generatedFrames + 1, cfg.presenter ? "on" : "off", cfg.vsync);
     game::LogGameInfo();
-    game::dshr::LogStatus();
     if (!cfg.enabled) {
         log::Info("Disabled in config - running as plain dxgi pass-through");
         return;
@@ -71,6 +70,7 @@ void Initialize() {
     if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
         hooks::Install(reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlExitUserProcess")), &hkRtlExitUserProcess,
                        &oRtlExitUserProcess, "ntdll!RtlExitUserProcess");
+    game::high_fps::Install(cfg.targetFps);
 }
 
 }  // namespace

@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/perf.h"
 #include "framegen/framegen.h"
+#include "game/high_fps.h"
 #include "hooks/d3d11_hooks.h"
 #include "hooks/d3d11_vtables.h"
 #include "hooks/hook_manager.h"
@@ -38,6 +39,7 @@ UINT g_nativeWidth = 0, g_nativeHeight = 0;
 HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* self, UINT syncInterval, UINT flags) {
     if (self != g_native || (flags & DXGI_PRESENT_TEST)) return oPresent(self, syncInterval, flags);
     perf::PresentEntered();
+    game::high_fps::OnFrame();
     render::upscale::OnPresent();
     if (!g_nativeRtv) {
         ComPtr<ID3D11Texture2D> buffer;

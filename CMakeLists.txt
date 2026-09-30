@@ -156,7 +156,7 @@ add_library(DSRUpscaler SHARED
     src/core/bootstrap.cpp
     src/core/config.cpp
     src/game/dsr.cpp
-    src/game/dshr.cpp
+    src/game/high_fps.cpp
     src/hooks/d3d11_hooks.cpp
     src/hooks/dxgi_hooks.cpp
     src/render/bridge.cpp

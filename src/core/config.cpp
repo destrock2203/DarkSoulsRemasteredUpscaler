@@ -103,6 +103,7 @@ void Load(const std::filesystem::path& file) {
     c.presenter = ReadBool(L"FrameGeneration", L"Presenter", c.presenter);
 
     c.vsync = std::clamp(ReadInt(L"Game", L"VSync", c.vsync), -1, 1);
+    c.targetFps = std::clamp(ReadInt(L"Game", L"TargetFPS", c.targetFps), 60, 500);
 
     c.overlayKey = ReadKey(L"Overlay", L"MenuKey", c.overlayKey);
     c.overlayStatusLine = ReadBool(L"Overlay", L"StatusLine", c.overlayStatusLine);
@@ -165,6 +166,11 @@ void SaveDlss5(bool enabled, float intensity, int style) {
     Write(L"DLSS5", L"Enabled", enabled ? "1" : "0");
     Write(L"DLSS5", L"Intensity", std::format("{:.2f}", intensity));
     Write(L"DLSS5", L"Style", std::to_string(style));
+}
+
+void SaveTargetFps(int fps) {
+    g_config.targetFps = fps;
+    Write(L"Game", L"TargetFPS", std::to_string(fps));
 }
 
 }  // namespace dsru::config
