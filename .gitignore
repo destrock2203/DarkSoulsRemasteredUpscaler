@@ -1,0 +1,13 @@
+build/
+out/
+.vs/
+.vscode/
+*.user
+CMakeUserPresets.json
+
+# Vendor SDKs are dropped in locally (licenses forbid redistributing some of them).
+third_party/*
+!third_party/README.md
+
+# Third-party mod binaries kept locally for reference, not ours to redistribute.
+ex/
