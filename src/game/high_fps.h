@@ -1,49 +1,36 @@
 #pragma once
 
-// Frame rate unlock with the game's speed kept. The engine is built around 60 FPS: its frame limiter
-// runs a clock at 60 ticks per second, and the update code hands a fixed 1/60 s time step to the
-// subsystems whatever the real frame time. Above 60 FPS the game would run too fast, so the unlock
-// raises the limiter and replaces that step with the real time since that updater last ran (on the
-// simulation thread, which can update more often than frames are presented), at most 1/60 s: the
-// speed is right at any frame rate from 60 up to the target (below 60 the game slows down, as the
-// original does; longer steps than the game ever had would risk its physics):
-//  - pacing: the limiter clock (a global, the object game/frame_timer.h describes) gets the target
-//    rate, its start moved so the schedule keeps its phase. The flipper's high refresh mode (owner mode
-//    5, FrpgFlipper_140FPS) is left alone: the engine sets its mode back every frame, and the clock
-//    alone sets the frame rate. The engine skips rendering a frame when it is late (2 updates for 1
-//    image: the image judders), so while the GPU is the limit the clock runs at what is presented,
-//    and goes back up as soon as the limiter's wait (measured on its QueryPerformanceCounter calls)
-//    shows capacity left unused.
-//    (Rendering every frame with FrpgFlipper_60FPS_NoSkip's methods crashed in Havok.)
-//  - simulation: MoveMapStep's step table (.data, the step at index 13 is the in-game update, float
-//    time step in xmm1), the cutscene (Remo) step table's index 9, the FX manager (frpgFxManagerBase,
-//    vtable slot 5) and the Havok world step (a call site in the main update function, relayed).
-//  - input: the repeat detectors (DLUI::DLUserInputRepeatDetector, slots 4 / 5) count their delays
-//    down by the time step; the menus act on a button press for as many frames as the press lasts, so
-//    one press is let through once per menu (the "menu action query" function, hooked); mouse deltas
-//    (DirectInput) are divided by the step scale as the camera turns by delta x time step.
-// Everything is found at runtime (patterns, RTTI); the code patches (Havok call site, menu query) are
-// made once the game has run for a few seconds, as the executable's protection only checks at startup.
+// Live frame rate limit, with DS1 FPS Unlock (game/fps_unlock_mod.h) loaded: that mod keeps the game's
+// speed at any frame rate (time steps from the measured frame time, physics, input and menu fixes) and
+// paces it with the engine's frame limiter; the limiter's clock is set here, so the menu moves the
+// limit while the game runs. Without the mod the game keeps its own 60 FPS: nothing is touched.
+//
+// The engine's frame limiter waits each frame until (QPC - start) x rate / frequency reaches the frame
+// count, on a clock object (a global, the object game/frame_timer.h describes) at 60 ticks per second.
+// The mod hands that wait a time running MaxFPS/60 times faster than real time, so the rate set here
+// is the target x 60 / MaxFPS, the clock's start moved so the schedule keeps its phase (the mod follows
+// a moved start). Found at runtime (pattern).
 namespace dsru::game::high_fps {
 
 inline constexpr int kGameFps = 60;
+inline constexpr int kMinFps = 30;
 inline constexpr int kMaxFps = 500;
 
-// Finds the engine's pieces and installs the data hooks (bootstrap, after hooks::Initialize).
-// `targetFps` <= 60: the game's own 60 FPS until SetTarget.
-void Install(int targetFps);
+// Finds the engine's frame clock (bootstrap). `modFps`: DS1 FPS Unlock's MaxFPS, 0 = not loaded (then
+// nothing happens). `targetFps`: the limit, 0 = the mod's MaxFPS until SetTarget.
+void Install(int targetFps, int modFps);
 
 // Every frame, on the thread that presents (the engine's frame limiter runs there).
 void OnFrame();
 
-// 60 = the game's 60 FPS; above, the unlock (applies at the next frame).
+// The limit, applied at the next frame.
 void SetTarget(int fps);
 
 struct Status {
-    bool available = false;  // everything found and hooked
-    bool active = false;     // the engine runs at `target`
+    bool available = false;  // the mod is loaded and the clock was found
+    bool active = false;     // the clock runs at `target`
     int target = kGameFps;
-    int limit = kGameFps;  // the clock's rate now: below the target while the GPU can't keep up
+    int modFps = 0;           // the mod's MaxFPS (0: not loaded)
     const char* reason = "";  // why unavailable or not active yet
 };
 Status GetStatus();

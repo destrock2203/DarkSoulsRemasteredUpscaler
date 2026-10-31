@@ -5,6 +5,7 @@
 #include "core/paths.h"
 #include "core/perf.h"
 #include "framegen/framegen.h"
+#include "game/fps_unlock_mod.h"
 #include "game/high_fps.h"
 #include "hooks/hook_manager.h"
 #include "render/presenter.h"
@@ -21,6 +22,7 @@
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <format>
@@ -213,6 +215,42 @@ Fps CurrentFps() {
     return f;
 }
 
+// The monitor the game is on: its refresh rate, read again every 2 s (0 = unknown).
+int RefreshRate() {
+    static ULONGLONG last = 0;
+    static int hz = 0;
+    if (const ULONGLONG now = GetTickCount64(); now - last >= 2000 && g_hwnd) {
+        last = now;
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        if (GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+            hz = static_cast<int>(mode.dmDisplayFrequency);
+    }
+    return hz;
+}
+
+// Frames on screen per game frame with frame generation as set (on in gameplay).
+int FrameGenMultiplier() {
+    const framegen::Status fg = framegen::GetStatus();
+    return fg.attached && fg.enabled ? static_cast<int>(fg.framesToGenerate) + 1 : 1;
+}
+
+// The game FPS limit whose frames on screen stay just below `refresh` Hz, inside the G-Sync / FreeSync
+// range (refresh - refresh^2 / 3600, as NVIDIA Reflex caps: 157 at 165 Hz, 138 at 144 Hz).
+int FitFps(int refresh, int multiplier) {
+    const double cap = refresh - refresh * static_cast<double>(refresh) / 3600.0;
+    return std::max(game::high_fps::kMinFps, static_cast<int>(cap / multiplier));
+}
+
+// AutoFPS: the limit follows the refresh rate and frame generation, as they change.
+void FollowRefreshRate() {
+    if (!config::Get().autoFps || !game::high_fps::GetStatus().available) return;
+    if (const int refresh = RefreshRate()) game::high_fps::SetTarget(FitFps(refresh, FrameGenMultiplier()));
+}
+
 void Help(const char* text) {
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
@@ -384,6 +422,38 @@ void SettingsWindow(const render::upscale::Status& s) {
     }
     ImGui::TextDisabled("Keep game FPS x multiplier at or below the refresh rate (Frame rate below).");
 
+    ImGui::SeparatorText("Sharpening");
+    const auto filterName = [](SharpenFilter f) {
+        switch (f) {
+            case SharpenFilter::Amd: return "AMD FidelityFX RCAS";
+            case SharpenFilter::Nvidia: return "NVIDIA Image Scaling (NIS)";
+            case SharpenFilter::Laplacian: return "Laplacian";
+            default: return "Off";
+        }
+    };
+    if (ImGui::BeginCombo("Filter", filterName(s.sharpenFilter))) {
+        for (const SharpenFilter f : kSharpenFilters) {
+            const bool unavailable = f == SharpenFilter::Nvidia && !s.nisAvailable;
+            if (ImGui::Selectable(filterName(f), f == s.sharpenFilter, unavailable ? ImGuiSelectableFlags_Disabled : 0))
+                render::upscale::SetSharpen(f, s.sharpness);
+        }
+        ImGui::EndCombo();
+    }
+    float sharpness = s.sharpness;
+    ImGui::BeginDisabled(s.sharpenFilter == SharpenFilter::Off);
+    if (ImGui::SliderFloat("Strength", &sharpness, 0.0f, 1.0f, "%.2f"))
+        render::upscale::SetSharpen(s.sharpenFilter, sharpness);
+    ImGui::EndDisabled();
+    if (s.sharpenFilter == SharpenFilter::Amd)
+        ImGui::TextDisabled("FSR's contrast-adaptive sharpening (any GPU).");
+    else if (s.sharpenFilter == SharpenFilter::Nvidia)
+        ImGui::TextDisabled("NVIDIA's adaptive directional sharpening (any GPU, through Streamline).");
+    else if (s.sharpenFilter == SharpenFilter::Laplacian)
+        ImGui::TextDisabled("Crisper edges than RCAS, halos kept in check by a clamp (as in Elden Ring's TAA).");
+    if (s.sharpenFilter == SharpenFilter::Nvidia && !s.nisAvailable)
+        ImGui::TextColored(kYellow, "Unavailable (see the log): AMD RCAS is used instead.");
+    ImGui::TextDisabled("On the scene before the HUD, any upscaler and with it off. 0 = none.");
+
     ImGui::SeparatorText("DLSS 5 (neural rendering)");
     bool dlss5 = s.dlss5Enabled;
     float dlss5Intensity = s.dlss5Intensity;
@@ -404,25 +474,44 @@ void SettingsWindow(const render::upscale::Status& s) {
 
     ImGui::SeparatorText("Frame rate");
     const game::high_fps::Status hf = game::high_fps::GetStatus();
-    if (!hf.available) {
+    const game::fps_unlock_mod::Info& mod = game::fps_unlock_mod::Get();
+    if (!mod.loaded) {
+        ImGui::TextDisabled("60 FPS (the game's). To unlock it, install DS1 FPS Unlock next to the game (dinput8.dll");
+        ImGui::TextDisabled("and DSR-FPS-Unlock.ini): github.com/zofrea1/DS1-FPS-Unlock-PTDE-Remastered");
+    } else if (!mod.variableFrameTime) {
+        ImGui::TextColored(kYellow, "DS1 FPS Unlock: set VariableFrameTime = true in DSR-FPS-Unlock.ini to set the limit");
+        ImGui::TextColored(kYellow, "here (with fixed steps the game's speed follows the limit). Now: MaxFPS %d.", mod.maxFps);
+    } else if (!hf.available) {
         ImGui::TextColored(kYellow, "Unavailable: %s", hf.reason);
     } else {
+        ImGui::TextDisabled("DS1 FPS Unlock %s keeps the game's speed; the limit is set here.", mod.version.c_str());
+        bool autoFps = config::Get().autoFps;
+        if (ImGui::Checkbox("Follow the refresh rate and frame generation", &autoFps)) config::SaveAutoFps(autoFps);
+        Help("Game FPS x frame generation multiplier just below the monitor's refresh rate (G-Sync / FreeSync range).");
         // Applied when the slider is released (each change restarts the engine's frame clock).
-        static int fps = config::Get().targetFps;
+        static int fps = hf.target;
+        static bool dragging = false;
+        if (!dragging) fps = hf.target;
+        ImGui::BeginDisabled(autoFps);
         ImGui::SetNextItemWidth(220.0f);
-        ImGui::SliderInt("Game FPS limit", &fps, game::high_fps::kGameFps, 360, fps <= 60 ? "60 (the game's)" : "%d");
+        ImGui::SliderInt("Game FPS limit", &fps, game::high_fps::kMinFps, 360);
+        dragging = ImGui::IsItemActive();
         if (ImGui::IsItemDeactivatedAfterEdit()) {
             game::high_fps::SetTarget(fps);
             config::SaveTargetFps(fps);
         }
-        if (hf.active)
-            if (hf.limit < hf.target)
-                ImGui::TextColored(kGreen, "Unlocked, held at %d FPS (the GPU's pace, no judder), game speed kept", hf.limit);
-            else
-                ImGui::TextColored(kGreen, "Unlocked at %d FPS, game speed kept", hf.target);
-        else if (hf.reason[0])
-            ImGui::TextDisabled("%s", hf.reason);
-        ImGui::TextDisabled("The game keeps its speed from 60 FPS up to the limit; below 60 it slows down as the original does.");
+        ImGui::EndDisabled();
+        const int multiplier = FrameGenMultiplier();
+        const int refresh = RefreshRate();
+        if (hf.reason[0])
+            ImGui::TextColored(kYellow, "%s", hf.reason);
+        else if (multiplier > 1)
+            ImGui::TextColored(kGreen, "%d FPS x %d frame generation = %d on screen (%d Hz monitor)", hf.target, multiplier,
+                               hf.target * multiplier, refresh);
+        else
+            ImGui::TextColored(kGreen, "%d FPS (%d Hz monitor)", hf.target, refresh);
+        if (!autoFps && refresh && hf.target * multiplier > refresh)
+            ImGui::TextColored(kYellow, "Above the refresh rate: %d would fit.", FitFps(refresh, multiplier));
     }
 
     ImGui::SeparatorText("Status");
@@ -458,6 +547,13 @@ void SettingsWindow(const render::upscale::Status& s) {
     if (ImGui::Checkbox("Show the status line", &statusLine)) config::SaveOverlayStatusLine(statusLine);
     ImGui::TextDisabled("Home: this window   F7: upscaler on/off   F8: DLSS 5 on/off");
     ImGui::TextDisabled("Every setting is saved to DSRUpscaler.ini as it changes.");
+
+    // Attribution required by the NVIDIA RTX SDK license (DLSS / NGX supplement).
+    ImGui::SeparatorText("Credits");
+    ImGui::TextDisabled("Uses NVIDIA DLSS, DLSS Frame Generation, Reflex, Image Scaling and Streamline (c) NVIDIA Corporation.");
+    ImGui::TextDisabled("Uses AMD FidelityFX (FSR, RCAS) (c) Advanced Micro Devices, Inc. and Intel XeSS (c) Intel Corporation.");
+    ImGui::TextDisabled("Not affiliated with or endorsed by NVIDIA, AMD, Intel, FromSoftware or Bandai Namco.");
+    ImGui::TextDisabled("Licenses: DARK SOULS REMASTERED\\DSRUpscaler\\licenses");
     ImGui::End();
     if (!open) SetMenuOpen(false);
 }
@@ -468,6 +564,7 @@ void Render(ID3D11DeviceContext* context, ID3D11RenderTargetView* target, UINT w
     if (!context || !target || !window) return;
     std::lock_guard lock(g_mutex);
     if (!Initialize(context, window, height)) return;
+    FollowRefreshRate();
 
     // Menu key (game window focused), polled like the other hotkeys.
     DWORD pid = 0;

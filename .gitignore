@@ -11,3 +11,6 @@ third_party/*
 
 # Third-party mod binaries kept locally for reference, not ours to redistribute.
 ex/
+
+# Python caches (modlist/tools)
+__pycache__/

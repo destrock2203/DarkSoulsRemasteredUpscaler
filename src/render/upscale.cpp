@@ -7,8 +7,10 @@
 #include "render/bridge.h"
 #include "render/d3d11_util.h"
 #include "render/presenter.h"
+#include "render/sharpen.h"
 #include "upscaler/dlss_nr/dlss_nr.h"
 #include "upscaler/fsr/fsr.h"
+#include "upscaler/streamline/streamline.h"
 #include "upscaler/upscaler.h"
 
 #include <Windows.h>
@@ -61,6 +63,7 @@ bridge::SharedTexture g_sceneLdr, g_upscaled;
 // Set at the TAA resolve of an upscaled frame, used at its first HUD draw (same command list).
 bool g_pendingValid = false;
 UpscaleInputs g_pending;
+bool g_pendingScaleOnly = false;  // upscaler off: the game's TAA image only scaled to the output, for DLSS 5
 bool g_upscaledReady = false;  // the frame's upscaled scene + HUD exist (its command list executed)
 uint32_t g_outputWidth = 0, g_outputHeight = 0;
 QualityMode g_activeMode = QualityMode::Native;
@@ -73,6 +76,10 @@ upscaler::dlss_nr::Options g_dlss5;
 std::atomic<uint64_t> g_dlss5RanAt{0};
 bool g_dlss5KeyDown = false;
 Microsoft::WRL::ComPtr<ID3D12Resource> g_nrOutput;  // D3D12 only, UNORDERED_ACCESS
+// Sharpening of the display-referred scene (render/sharpen.h, streamline::EvaluateNis), after DLSS 5.
+SharpenFilter g_sharpenFilter = SharpenFilter::Off;
+float g_sharpness = 0.5f;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_sharpenOutput;  // D3D12 only, UNORDERED_ACCESS
 bridge::SharedTexture g_nrScene;                    // native resolution: the scene, RGBA16F
 bool g_nativePendingValid = false;                  // TAA inputs of the frame, for DLSS 5 at its HUD
 UpscaleInputs g_nativePending;
@@ -217,19 +224,78 @@ void Dlss5Ran(const Dlss5Request& r, bool ok) {
     }
 }
 
-// Native resolution: DLSS 5 on the scene copy (immediate context thread, between the command list halves).
-void RunNeural(UpscaleInputs in, Dlss5Request nr) {
+struct SharpenRequest {
+    SharpenFilter filter = SharpenFilter::Off;
+    float sharpness = 0.0f;
+    bool Wanted() const { return filter != SharpenFilter::Off && sharpness > 0.0f; }
+};
+
+SharpenRequest SharpenNow() { return {g_sharpenFilter, g_sharpness}; }
+bool SharpenWanted() { return SharpenNow().Wanted(); }
+
+// `color` (RGBA16F, COMMON, display-referred) sharpened in place: the filter into g_sharpenOutput, then
+// copied back. NVIDIA Image Scaling (and the Laplacian, if its pass fails) fall back to AMD RCAS.
+// Immediate context thread.
+void Sharpen(ID3D12GraphicsCommandList* list, ID3D12Resource* color, const SharpenRequest& sr) {
+    if (!sr.Wanted()) return;
+    const D3D12_RESOURCE_DESC desc = color->GetDesc();
+    const auto width = static_cast<uint32_t>(desc.Width);
+    const uint32_t height = desc.Height;
+    if (!g_sharpenOutput || g_sharpenOutput->GetDesc().Width != desc.Width || g_sharpenOutput->GetDesc().Height != height) {
+        g_sharpenOutput.Reset();
+        D3D12_RESOURCE_DESC out = desc;
+        out.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT};
+        if (FAILED(bridge::Device12()->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &out,
+                                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                               IID_PPV_ARGS(&g_sharpenOutput))))
+            return;
+        g_sharpenOutput->SetName(L"DSRUpscaler sharpen output");
+    }
+    constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_BARRIER before = bridge::Transition(color, D3D12_RESOURCE_STATE_COMMON, kRead);
+    list->ResourceBarrier(1, &before);
+    bool ok = false;
+    if (sr.filter == SharpenFilter::Nvidia) {
+        ok = streamline::NisAvailable() &&
+             streamline::EvaluateNis(list, color, kRead, g_sharpenOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                     width, height, sr.sharpness);
+        static bool logged = false;
+        if (!ok && !logged) {
+            logged = true;
+            log::Warn("Sharpen: NVIDIA Image Scaling unavailable - AMD RCAS instead");
+        }
+    }
+    if (!ok && sr.filter == SharpenFilter::Laplacian)
+        ok = sharpen::Laplacian(bridge::Device12(), list, color, g_sharpenOutput.Get(), width, height, sr.sharpness);
+    if (!ok)
+        ok = sharpen::Rcas(bridge::Device12(), list, color, g_sharpenOutput.Get(), width, height, sr.sharpness);
+    const D3D12_RESOURCE_BARRIER after[2] = {
+        bridge::Transition(color, kRead, D3D12_RESOURCE_STATE_COPY_DEST),
+        bridge::Transition(g_sharpenOutput.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)};
+    list->ResourceBarrier(2, after);
+    if (ok) list->CopyResource(color, g_sharpenOutput.Get());
+    const D3D12_RESOURCE_BARRIER back[2] = {
+        bridge::Transition(color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON),
+        bridge::Transition(g_sharpenOutput.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)};
+    list->ResourceBarrier(2, back);
+}
+
+// DLSS 5 and / or sharpening without the upscaler, on `color` (immediate context thread, between the
+// command list halves): the scene copy at native resolution, or the game's image scaled to the output.
+void RunPost(UpscaleInputs in, Dlss5Request nr, SharpenRequest sr, ID3D12Resource* color) {
     const uint64_t ready = bridge::SignalFrom11();
     bridge::WaitOn12(ready);
     ID3D12GraphicsCommandList* list = bridge::BeginList();
-    const bool ok = NeuralRender(list, g_nrScene.d3d12.Get(), in, nr.reset, nr.options);
+    const bool ok = nr.enabled && NeuralRender(list, color, in, nr.reset, nr.options);
+    Sharpen(list, color, sr);
     bridge::Submit(list);
     bridge::WaitOn11(bridge::SignalFrom12());
-    Dlss5Ran(nr, ok);
+    if (nr.enabled) Dlss5Ran(nr, ok);
 }
 
 // The upscaler on the D3D12 bridge, between the two halves of the frame (immediate context thread).
-void RunUpscaler(UpscaleInputs in, Backend backend, uint32_t preset, Dlss5Request nr = {}) {
+void RunUpscaler(UpscaleInputs in, Backend backend, uint32_t preset, Dlss5Request nr = {}, SharpenRequest sr = {}) {
     const uint64_t ready = bridge::SignalFrom11();
     bridge::WaitOn12(ready);
     ID3D12GraphicsCommandList* list = bridge::BeginList();
@@ -237,6 +303,9 @@ void RunUpscaler(UpscaleInputs in, Backend backend, uint32_t preset, Dlss5Reques
     const bool ok = upscaler::Evaluate(backend, in, preset);
     // DLSS 5 on the upscaled scene (the HUD is drawn over it afterwards).
     if (ok && nr.enabled) Dlss5Ran(nr, NeuralRender(list, in.output, in, nr.reset, nr.options));
+    // Sharpening of the upscaled (display-referred) scene; the native path's output is HDR, sharpened at
+    // the HUD instead (RunPost).
+    if (ok && !in.colorHdr) Sharpen(list, in.output, sr);
     bridge::Submit(list);
     bridge::WaitOn11(bridge::SignalFrom12());
     g_lastRunOk = ok;
@@ -267,6 +336,8 @@ void OnDeviceCreated(ID3D11Device* device, ID3D11DeviceContext* immediate) {
         g_dlss5.localStructure = cfg.dlss5LocalStructure;
         g_dlss5.skinStructure = cfg.dlss5SkinStructure;
         g_dlss5.style = static_cast<uint32_t>(cfg.dlss5Style);
+        g_sharpenFilter = cfg.sharpenFilter;
+        g_sharpness = cfg.sharpness;
     }
     fsr::SetVersion(cfg.fsrVersion);
     d3d11::Initialize(device);
@@ -298,7 +369,7 @@ bool OnTaaDraw(ContextState& s, const std::function<void()>& draw) {
     const uint64_t present = g_present.load(std::memory_order_relaxed);
     g_taaSeenAt = present;
     const bool frameGen = framegen::Wanted();
-    if ((!UpscalerWanted() && !frameGen && !g_dlss5Enabled) || !bridge::Ready()) return false;
+    if ((!UpscalerWanted() && !frameGen && !g_dlss5Enabled && !SharpenWanted()) || !bridge::Ready()) return false;
 
     ID3D11ShaderResourceView* colorSrv = s.psSrv[0];
     ID3D11ShaderResourceView* depthSrv = s.psSrv[2];
@@ -442,6 +513,7 @@ bool OnTaaDraw(ContextState& s, const std::function<void()>& draw) {
         in.colorHdr = false;  // upscaled after tone mapping
         g_pending = in;
         g_pendingValid = true;
+        g_pendingScaleOnly = false;
         g_outputWidth = outW;
         g_outputHeight = outH;
         g_activeMode = in.quality;
@@ -453,9 +525,21 @@ bool OnTaaDraw(ContextState& s, const std::function<void()>& draw) {
     g_outputWidth = width;
     g_outputHeight = height;
     g_activeMode = QualityMode::Native;
-    g_nativePending = in;
-    g_nativePendingValid = g_dlss5Enabled;
+    // Upscaler off, DLSS 5 or sharpening on, the game below the screen: the game's TAA image is scaled to
+    // the output (bilinear) at the first HUD draw and they run there, as after the upscaler. DLSS 5 at the
+    // game's resolution hung the GPU within seconds (DXGI_ERROR_DEVICE_HUNG, 2560x1440 on 3840x2160).
+    if (below && !UpscalerWanted() && (Dlss5Now().enabled || SharpenWanted())) {
+        draw();
+        in.outputSize = {outW, outH};
+        g_pending = in;
+        g_pendingValid = true;
+        g_pendingScaleOnly = true;
+        g_split = s.deferred;
+        return true;
+    }
     const bool upscale = UpscalerWanted() && upscaler::Available(backend) && g_color.rtv != nullptr;
+    g_nativePending = in;
+    g_nativePendingValid = g_dlss5Enabled || SharpenWanted();
     if (upscale) d3d11::Blit(s.context, colorSrv, g_color.rtv.Get(), width, height);
 
     draw();  // the game's resolve: its history / other outputs stay the game's
@@ -511,6 +595,7 @@ bool EnsureCopy(ID3D11DeviceContext* context, ComPtr<ID3D11Texture2D>& texture, 
 void UpscaleAtHud(ContextState& s, ID3D11Resource* target, const D3D11_TEXTURE2D_DESC& desc) {
     UpscaleInputs in = g_pending;
     g_pendingValid = false;
+    const bool scaleOnly = g_pendingScaleOnly;
     const UINT outW = in.outputSize.width, outH = in.outputSize.height;
     if (desc.Width != in.renderSize.width || desc.Height != in.renderSize.height) return;
     using namespace bridge;
@@ -528,20 +613,27 @@ void UpscaleAtHud(ContextState& s, ID3D11Resource* target, const D3D11_TEXTURE2D
         device->CreateShaderResourceView(target, &srvDesc, &sceneSrv);
     }
     if (!sceneSrv ||
-        !EnsureShared(g_sceneLdr, desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT, kShaderResource | kRenderTarget,
-                      L"DSRUpscaler scene (LDR)") ||
+        (!scaleOnly && !EnsureShared(g_sceneLdr, desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT,
+                                     kShaderResource | kRenderTarget, L"DSRUpscaler scene (LDR)")) ||
         !EnsureShared(g_upscaled, outW, outH, DXGI_FORMAT_R16G16B16A16_FLOAT, kShaderResource | kRenderTarget | kUnorderedAccess,
                       L"DSRUpscaler upscaled scene")) {
         g_reason = "upscaling textures could not be created";
         return;
     }
-    d3d11::Blit(s.context, sceneSrv.Get(), g_sceneLdr.rtv.Get(), desc.Width, desc.Height);
-    in.color = g_sceneLdr.d3d12.Get();
     in.output = g_upscaled.d3d12.Get();
-    const Backend backend = g_backend;
-    const uint32_t preset = g_dlssPreset;
     const Dlss5Request nr = Dlss5Now();
-    hooks::d3d11::SplitHere(s, [in, backend, preset, nr] { RunUpscaler(in, backend, preset, nr); });
+    const SharpenRequest sr = SharpenNow();
+    if (scaleOnly) {
+        d3d11::Blit(s.context, sceneSrv.Get(), g_upscaled.rtv.Get(), outW, outH);
+        ID3D12Resource* scaled = g_upscaled.d3d12.Get();
+        hooks::d3d11::SplitHere(s, [in, nr, sr, scaled] { RunPost(in, nr, sr, scaled); });
+    } else {
+        d3d11::Blit(s.context, sceneSrv.Get(), g_sceneLdr.rtv.Get(), desc.Width, desc.Height);
+        in.color = g_sceneLdr.d3d12.Get();
+        const Backend backend = g_backend;
+        const uint32_t preset = g_dlssPreset;
+        hooks::d3d11::SplitHere(s, [in, backend, preset, nr, sr] { RunUpscaler(in, backend, preset, nr, sr); });
+    }
     // The HUD-less upscaled scene for frame generation, before the HUD is drawn over it.
     const bool frameGen = framegen::Wanted();
     if (frameGen) {
@@ -552,10 +644,10 @@ void UpscaleAtHud(ContextState& s, ID3D11Resource* target, const D3D11_TEXTURE2D
     }
     hooks::d3d11::BeginRedirect(s, s.rtv[0], g_upscaled.rtv.Get(), static_cast<float>(outW) / desc.Width,
                                 static_cast<float>(outH) / desc.Height);
-    hooks::d3d11::AtExecute(s, [in, frameGen] {
+    hooks::d3d11::AtExecute(s, [in, frameGen, scaleOnly] {
         std::lock_guard frameLock(g_mutex);
         // The upscaler failed: the presenter shows the game's image (stretched) instead of a black one.
-        g_upscaledReady = g_lastRunOk.load();
+        g_upscaledReady = scaleOnly || g_lastRunOk.load();
         if (frameGen) {
             g_scenePreReady = true;
             g_frame.inputs = in;
@@ -577,11 +669,14 @@ void OnHudDraw(ContextState& s) {
     if (g_nativePendingValid) {
         g_nativePendingValid = false;
         const Dlss5Request nr = Dlss5Now();
-        if (nr.enabled && desc.Width == g_nativePending.renderSize.width &&
+        const SharpenRequest sr = SharpenNow();
+        if ((nr.enabled || sr.Wanted()) && desc.Width == g_nativePending.renderSize.width &&
             desc.Height == g_nativePending.renderSize.height &&
+            // Unordered access too, like the upscaled scene DLSS 5 gets in the upscaling path.
             bridge::EnsureShared(g_nrScene, desc.Width, desc.Height, DXGI_FORMAT_R16G16B16A16_FLOAT,
-                                 bridge::kShaderResource | bridge::kRenderTarget, L"DSRUpscaler DLSS 5 scene")) {
-            // The scene (LDR) as RGBA16F for DLSS 5, and its result back into the scene target.
+                                 bridge::kShaderResource | bridge::kRenderTarget | bridge::kUnorderedAccess,
+                                 L"DSRUpscaler DLSS 5 scene")) {
+            // The scene (LDR) as RGBA16F for DLSS 5 / sharpening, and the result back into the scene target.
             ComPtr<ID3D11ShaderResourceView> sceneSrv;
             ComPtr<ID3D11Device> device;
             s.context->GetDevice(&device);
@@ -595,7 +690,8 @@ void OnHudDraw(ContextState& s) {
                 ID3D11RenderTargetView* sceneTarget = s.rtv[0];
                 d3d11::Blit(s.context, sceneSrv.Get(), g_nrScene.rtv.Get(), desc.Width, desc.Height);
                 const UpscaleInputs in = g_nativePending;
-                hooks::d3d11::SplitHere(s, [in, nr] { RunNeural(in, nr); });
+                ID3D12Resource* scene = g_nrScene.d3d12.Get();
+                hooks::d3d11::SplitHere(s, [in, nr, sr, scene] { RunPost(in, nr, sr, scene); });
                 d3d11::Blit(s.context, g_nrScene.srv.Get(), sceneTarget, desc.Width, desc.Height);
             }
         }
@@ -779,6 +875,9 @@ Status GetStatus() {
     s.dlss5Reason = upscaler::dlss_nr::UnavailableReason();
     s.dlss5Intensity = g_dlss5.intensity;
     s.dlss5Style = static_cast<int>(g_dlss5.style);
+    s.sharpenFilter = g_sharpenFilter;
+    s.sharpness = g_sharpness;
+    s.nisAvailable = streamline::NisAvailable();
     return s;
 }
 
@@ -842,6 +941,16 @@ void SetDlss5(bool enabled, float intensity, int style) {
     }
     log::Info("DLSS 5: {} (intensity {:.2f}, style {})", enabled ? "on" : "off", intensity, style);
     config::SaveDlss5(enabled, intensity, style);
+}
+
+void SetSharpen(SharpenFilter filter, float sharpness) {
+    sharpness = std::clamp(sharpness, 0.0f, 1.0f);
+    {
+        std::lock_guard lock(g_mutex);
+        g_sharpenFilter = filter;
+        g_sharpness = sharpness;
+    }
+    config::SaveSharpen(filter, sharpness);
 }
 
 void Shutdown() {

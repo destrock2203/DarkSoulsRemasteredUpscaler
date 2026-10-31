@@ -119,6 +119,13 @@ public:
                                static_cast<DWORD>(GetWindowLongPtrW(hwnd_, GWL_EXSTYLE)));
             SetWindowPos(hwnd_, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        } else if (fullscreen_ && mode->Width && mode->Height && (mode->Width != width_ || mode->Height != height_)) {
+            // A resolution change in fullscreen: a display mode change would resize the window, and the game
+            // resizes its buffers when its window really changes size (a posted WM_SIZE alone is ignored).
+            // The borderless window keeps the monitor's size: it leaves and covers the monitor again.
+            log::Info("Presenter: fullscreen resolution {}x{} requested", mode->Width, mode->Height);
+            LeaveBorderless();
+            EnterBorderless();
         }
         return S_OK;
     }
@@ -438,7 +445,20 @@ private:
         framegen::AfterPresent();
         bridge::WaitOn11(bridge::SignalFrom12());
         perf::PresentReturned();
-        if (FAILED(hr)) log::Error("Presenter: Present failed: 0x{:08x}", static_cast<unsigned>(hr));
+        if (FAILED(hr)) {
+            // Once the D3D12 device is lost every Present fails the same way: the first one logs why.
+            static bool lost = false;
+            const bool removed = hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+                                 hr == DXGI_ERROR_DEVICE_HUNG;
+            if (!removed)
+                log::Error("Presenter: Present failed: 0x{:08x}", static_cast<unsigned>(hr));
+            else if (!lost) {
+                lost = true;
+                log::Error("Presenter: Present failed: 0x{:08x}, the D3D12 device is lost (reason 0x{:08x}) - the "
+                           "image stops here, restart the game",
+                           static_cast<unsigned>(hr), static_cast<unsigned>(bridge::Device12()->GetDeviceRemovedReason()));
+            }
+        }
         return hr;
     }
 

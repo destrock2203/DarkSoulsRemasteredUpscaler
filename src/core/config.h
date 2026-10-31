@@ -31,6 +31,9 @@ struct Config {
     // The game's resolution below the monitor's in a window: the window covers the monitor so the
     // upscaler fills the screen.
     bool fillScreen = true;
+    // Sharpening of the final scene, any upscaler and with it off; strength 0 - 1.
+    SharpenFilter sharpenFilter = SharpenFilter::Off;
+    float sharpness = 0.5f;
 
     // [DLSS5] - neural rendering (upscaler/dlss_nr) of the HUD-less scene, also written by the overlay
     bool dlss5Enabled = false;
@@ -55,8 +58,10 @@ struct Config {
     // frames), 1 = on. The game's fullscreen would switch the display to 60 Hz; the presenter's borderless
     // window keeps the desktop rate, where 60 FPS with V-Sync judders.
     int vsync = 0;
-    // Frame rate limit (game/high_fps.h): 60 = the game's own, above = unlocked with the game's speed kept.
-    int targetFps = 60;
+    // Frame rate limit with DS1 FPS Unlock (game/high_fps.h), 0 = its MaxFPS.
+    int targetFps = 0;
+    // The limit follows the monitor's refresh rate and the frame generation multiplier.
+    bool autoFps = true;
 
     // [Overlay]
     int overlayKey = 0x24;  // VK_HOME
@@ -76,10 +81,12 @@ void SaveUpscaler(bool enabled, Backend backend, QualityMode quality);
 void SaveDlssPreset(uint32_t preset);
 void SaveFsrVersion(const std::string& version);
 void SaveJitter(bool flipX, bool flipY);
+void SaveSharpen(SharpenFilter filter, float sharpness);
 void SaveFrameGeneration(bool enabled, int generatedFrames);
 void SaveFrameGenerationBackend(Backend backend);  // applies at the next launch
 void SaveOverlayStatusLine(bool visible);
 void SaveDlss5(bool enabled, float intensity, int style);
 void SaveTargetFps(int fps);
+void SaveAutoFps(bool enabled);
 
 }  // namespace dsru::config

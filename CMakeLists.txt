@@ -148,6 +148,7 @@ endfunction()
 dsru_shader(src/shaders/motion_vectors.hlsl main cs_5_0 motion_vectors_cs)
 dsru_shader(src/shaders/blit.hlsl vs_main vs_5_0 blit_vs)
 dsru_shader(src/shaders/blit.hlsl ps_main ps_5_0 blit_ps)
+dsru_shader(src/shaders/sharpen.hlsl main cs_5_0 sharpen_cs)
 
 add_library(DSRUpscaler SHARED
     src/dllmain.cpp
@@ -156,12 +157,14 @@ add_library(DSRUpscaler SHARED
     src/core/bootstrap.cpp
     src/core/config.cpp
     src/game/dsr.cpp
+    src/game/fps_unlock_mod.cpp
     src/game/high_fps.cpp
     src/hooks/d3d11_hooks.cpp
     src/hooks/dxgi_hooks.cpp
     src/render/bridge.cpp
     src/render/d3d11_util.cpp
     src/render/presenter.cpp
+    src/render/sharpen.cpp
     src/render/upscale.cpp
     src/framegen/framegen.cpp
     src/overlay/overlay.cpp
@@ -193,8 +196,16 @@ if(EXISTS "${DSRU_STREAMLINE_DIR}/include/sl.h")
         sl.reflex.dll sl.pcl.dll sl.nis.dll)
     list(TRANSFORM DSRU_SL_RUNTIME PREPEND "${DSRU_STREAMLINE_DIR}/bin/x64/")
     add_custom_command(TARGET DSRUpscaler POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}"
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DSRU_SL_RUNTIME} "${DSRU_RUNTIME_DIR}")
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}/licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DSRU_SL_RUNTIME} "${DSRU_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_STREAMLINE_DIR}/license.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/Streamline-license.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_STREAMLINE_DIR}/bin/x64/nvngx_dlss.license.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/NVIDIA-DLSS-license.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_STREAMLINE_DIR}/bin/x64/reflex.license.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/NVIDIA-Reflex-license.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_STREAMLINE_DIR}/bin/x64/nis.license.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/NVIDIA-NIS-license.txt")
 else()
     message(STATUS "Streamline SDK not found - DLSS will be unavailable")
 endif()
@@ -210,7 +221,10 @@ if(EXISTS "${DSRU_FIDELITYFX_DIR}/api/include/ffx_api.h")
             "${DSRU_FIDELITYFX_DIR}/signedbin/amd_fidelityfx_loader_dx12.dll"
             "${DSRU_FIDELITYFX_DIR}/signedbin/amd_fidelityfx_upscaler_dx12.dll"
             "${DSRU_FIDELITYFX_DIR}/signedbin/amd_fidelityfx_framegeneration_dx12.dll"
-            "${DSRU_RUNTIME_DIR}")
+            "${DSRU_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}/licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_FIDELITYFX_DIR}/license.md"
+            "${DSRU_RUNTIME_DIR}/licenses/AMD-FidelityFX-license.md")
 else()
     message(STATUS "FidelityFX SDK not found - FSR will be unavailable")
 endif()
@@ -221,7 +235,12 @@ if(EXISTS "${DSRU_XESS_DIR}/inc/xess/xess_d3d12.h")
     add_custom_command(TARGET DSRUpscaler POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_XESS_DIR}/bin/libxess.dll"
-            "${DSRU_XESS_DIR}/bin/libxess_fg.dll" "${DSRU_XESS_DIR}/bin/libxell.dll" "${DSRU_RUNTIME_DIR}")
+            "${DSRU_XESS_DIR}/bin/libxess_fg.dll" "${DSRU_XESS_DIR}/bin/libxell.dll" "${DSRU_RUNTIME_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}/licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_XESS_DIR}/LICENSE.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/Intel-XeSS-license.txt"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DSRU_XESS_DIR}/third-party-programs.txt"
+            "${DSRU_RUNTIME_DIR}/licenses/Intel-XeSS-third-party-programs.txt")
 else()
     message(STATUS "XeSS SDK not found - XeSS will be unavailable")
 endif()
@@ -243,6 +262,17 @@ if(EXISTS "${DSRU_NGX_DIR}/include/nvsdk_ngx.h")
 else()
     message(STATUS "NGX SDK not found - DLSS 5 will be unavailable")
 endif()
+
+# License notices of the code compiled into dxgi.dll (shipped by package.ps1): MinHook, Dear ImGui, and
+# AMD's MIT license for RCAS (from FSR 1, not covered by the FidelityFX SDK's binary license).
+add_custom_command(TARGET DSRUpscaler POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DSRU_RUNTIME_DIR}/licenses"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${minhook_SOURCE_DIR}/LICENSE.txt"
+        "${DSRU_RUNTIME_DIR}/licenses/MinHook-license.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${imgui_SOURCE_DIR}/LICENSE.txt"
+        "${DSRU_RUNTIME_DIR}/licenses/DearImGui-license.txt"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/dist/licenses/AMD-FSR1-RCAS-license.txt"
+        "${DSRU_RUNTIME_DIR}/licenses/AMD-FSR1-RCAS-license.txt")
 
 add_custom_command(TARGET DSRUpscaler POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/dist/DSRUpscaler.ini" "$<TARGET_FILE_DIR:DSRUpscaler>")

@@ -69,6 +69,10 @@ struct Status {
     const char* dlss5Reason = "";   // why it is unavailable, "" if not known to be
     float dlss5Intensity = 1.0f;
     int dlss5Style = 1;
+    // Sharpening of the final scene
+    SharpenFilter sharpenFilter = SharpenFilter::Off;
+    float sharpness = 0.5f;
+    bool nisAvailable = false;  // NVIDIA Image Scaling (else AMD RCAS stands in)
 };
 Status GetStatus();
 
@@ -79,6 +83,8 @@ void SetFsrVersion(const std::string& version);
 void SetJitterFlip(bool x, bool y);
 // DLSS 5 on the HUD-less scene. Saved to the ini.
 void SetDlss5(bool enabled, float intensity, int style);
+// Sharpening filter and strength (0 - 1), live. Saved to the ini.
+void SetSharpen(SharpenFilter filter, float sharpness);
 
 void Shutdown();
 

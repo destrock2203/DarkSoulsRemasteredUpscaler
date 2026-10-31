@@ -10,8 +10,8 @@
 //    (legacy description): B8G8R8A8_UNORM, 2 buffers, DXGI_SWAP_EFFECT_DISCARD, then
 //    SetFullscreenState(TRUE) in fullscreen mode. Eight deferred contexts record from worker threads.
 //  - protected against code changes (a second, obfuscated .text section, some functions only jump into
-//    it): import-table hooks, COM hooks and data writes (vtables, step tables) are safe; the two code
-//    patches game/high_fps.h needs are made once the game has run for a few seconds.
+//    it): import-table hooks, COM hooks and data writes (vtables, step tables) are safe; code patches
+//    only once the game has run for a few seconds.
 //  - RTTI kept: NS_FRPG::FrpgFlipper_* frame pacing classes (game/flipper.h), ImageProcess* post
 //    processing classes (ImageProcessResolveTAA, ImageProcessToneMap, ...).
 //  - debug strings: "Antialiasing mode: Off / FXAA / FXAA High / Temporal", "FlipMode 30FPS / 60FPS /
@@ -51,8 +51,8 @@
 //  - Constant buffers: one per shader kind, Map(WRITE_DISCARD) before every draw (~9000 per frame),
 //    bound with VS/PSSetConstantBuffers1 (null offsets). Depth: D24_UNORM_S8_UINT.
 //  - Frame rate: 60 FPS from a busy-wait on QueryPerformanceCounter against an engine clock whose rate
-//    is a data field (game/frame_timer.h). The FrpgFlipper_140FPS class swap alone changes nothing: the
-//    unlock (game/high_fps.h) also sets the owner's mode and the clock's rate, and fixes the time steps.
+//    is a data field (game/frame_timer.h). The FrpgFlipper_140FPS class swap alone changes nothing (the
+//    engine sets the owner's mode back every frame): the clock's rate sets the frame rate (game/high_fps.h).
 namespace dsru::game {
 
 // Logs the executable's name, version and PE timestamp; warns if it isn't DarkSoulsRemastered.exe.

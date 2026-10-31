@@ -6,6 +6,7 @@
 #include "core/log.h"
 #include "core/paths.h"
 #include "game/dsr.h"
+#include "game/fps_unlock_mod.h"
 #include "game/high_fps.h"
 #include "hooks/dxgi_hooks.h"
 #include "hooks/hook_manager.h"
@@ -70,7 +71,9 @@ void Initialize() {
     if (HMODULE ntdll = GetModuleHandleW(L"ntdll.dll"))
         hooks::Install(reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlExitUserProcess")), &hkRtlExitUserProcess,
                        &oRtlExitUserProcess, "ntdll!RtlExitUserProcess");
-    game::high_fps::Install(cfg.targetFps);
+    // The frame rate limit is set live only through DS1 FPS Unlock, which keeps the game's speed.
+    const game::fps_unlock_mod::Info& mod = game::fps_unlock_mod::Detect();
+    game::high_fps::Install(cfg.targetFps, mod.loaded && mod.variableFrameTime ? mod.maxFps : 0);
 }
 
 }  // namespace

@@ -72,9 +72,10 @@ Backend ParseBackend(std::string_view text, Backend fallback) {
 
 const char* ToString(SharpenFilter filter) {
     switch (filter) {
-        case SharpenFilter::Game: return "Game";
+        case SharpenFilter::Off: return "Off";
         case SharpenFilter::Amd: return "AMD";
         case SharpenFilter::Nvidia: return "NVIDIA";
+        case SharpenFilter::Laplacian: return "Laplacian";
     }
     return "?";
 }

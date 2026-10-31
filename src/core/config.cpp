@@ -87,6 +87,8 @@ void Load(const std::filesystem::path& file) {
     c.jitterFlipX = ReadBool(L"Upscaler", L"JitterFlipX", c.jitterFlipX);
     c.jitterFlipY = ReadBool(L"Upscaler", L"JitterFlipY", c.jitterFlipY);
     c.fillScreen = ReadBool(L"Upscaler", L"FillScreen", c.fillScreen);
+    c.sharpenFilter = ParseSharpenFilter(Narrow(ReadString(L"Upscaler", L"Sharpen", L"")), c.sharpenFilter);
+    c.sharpness = std::clamp(ReadFloat(L"Upscaler", L"Sharpness", c.sharpness), 0.0f, 1.0f);
 
     c.dlss5Enabled = ReadBool(L"DLSS5", L"Enabled", c.dlss5Enabled);
     c.dlss5Key = ReadKey(L"DLSS5", L"Key", c.dlss5Key);
@@ -103,7 +105,9 @@ void Load(const std::filesystem::path& file) {
     c.presenter = ReadBool(L"FrameGeneration", L"Presenter", c.presenter);
 
     c.vsync = std::clamp(ReadInt(L"Game", L"VSync", c.vsync), -1, 1);
-    c.targetFps = std::clamp(ReadInt(L"Game", L"TargetFPS", c.targetFps), 60, 500);
+    c.targetFps = ReadInt(L"Game", L"TargetFPS", c.targetFps);
+    if (c.targetFps) c.targetFps = std::clamp(c.targetFps, 30, 500);
+    c.autoFps = ReadBool(L"Game", L"AutoFPS", c.autoFps);
 
     c.overlayKey = ReadKey(L"Overlay", L"MenuKey", c.overlayKey);
     c.overlayStatusLine = ReadBool(L"Overlay", L"StatusLine", c.overlayStatusLine);
@@ -132,6 +136,13 @@ void SaveDlssPreset(uint32_t preset) {
 void SaveFsrVersion(const std::string& version) {
     g_config.fsrVersion = version;
     Write(L"Upscaler", L"FsrVersion", version);
+}
+
+void SaveSharpen(SharpenFilter filter, float sharpness) {
+    g_config.sharpenFilter = filter;
+    g_config.sharpness = sharpness;
+    Write(L"Upscaler", L"Sharpen", ToString(filter));
+    Write(L"Upscaler", L"Sharpness", std::format("{:.2f}", sharpness));
 }
 
 void SaveJitter(bool flipX, bool flipY) {
@@ -171,6 +182,11 @@ void SaveDlss5(bool enabled, float intensity, int style) {
 void SaveTargetFps(int fps) {
     g_config.targetFps = fps;
     Write(L"Game", L"TargetFPS", std::to_string(fps));
+}
+
+void SaveAutoFps(bool enabled) {
+    g_config.autoFps = enabled;
+    Write(L"Game", L"AutoFPS", enabled ? "1" : "0");
 }
 
 }  // namespace dsru::config

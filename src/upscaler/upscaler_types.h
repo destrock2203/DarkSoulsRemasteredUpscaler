@@ -44,11 +44,13 @@ QualityMode ModeForRatio(Backend backend, float ratio);
 // Display name: "DLAA", "FSR Native AA", "Quality", ...
 const char* ModeName(Backend backend, QualityMode mode);
 
-// The sharpening filter on the upscaler's image: the game's own, AMD FidelityFX RCAS or NVIDIA
-// Image Scaling (render/sharpen.h, streamline::EvaluateNis). XeSS has no sharpening of its own.
-enum class SharpenFilter : uint8_t { Game, Amd, Nvidia };
-inline constexpr SharpenFilter kSharpenFilters[] = {SharpenFilter::Game, SharpenFilter::Amd, SharpenFilter::Nvidia};
-const char* ToString(SharpenFilter filter);  // ini value: "Game", "AMD", "NVIDIA"
+// The sharpening filter on the final scene (before the HUD): none, AMD FidelityFX RCAS, NVIDIA Image
+// Scaling or a log-space Laplacian (render/sharpen.h, streamline::EvaluateNis). DLSS's presets and XeSS
+// have none of their own, FSR's is off.
+enum class SharpenFilter : uint8_t { Off, Amd, Nvidia, Laplacian };
+inline constexpr SharpenFilter kSharpenFilters[] = {SharpenFilter::Off, SharpenFilter::Amd, SharpenFilter::Nvidia,
+                                                    SharpenFilter::Laplacian};
+const char* ToString(SharpenFilter filter);  // ini value: "Off", "AMD", "NVIDIA", "Laplacian"
 SharpenFilter ParseSharpenFilter(std::string_view text, SharpenFilter fallback);
 
 // DLSS presets (sl::DLSSPreset values): 0 = NVIDIA's default for each mode.
